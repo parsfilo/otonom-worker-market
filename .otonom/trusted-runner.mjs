@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.5
+// OTONOM Trusted Worker Runner — version 2026.09.6
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -71,6 +71,11 @@ function redactKnownSecrets(text, taskSecrets = {}) {
   for (const value of Object.values(taskSecrets)) {
     if (typeof value === 'string' && value.length >= 4) {
       result = result.split(value).join('[REDACTED]');
+      // Multi-line material (private keys) must also not leak line by line
+      // when output is truncated or re-wrapped.
+      for (const line of value.split(/\r?\n/)) {
+        if (line.length >= 16) result = result.split(line).join('[REDACTED]');
+      }
     }
   }
   return result;
@@ -563,7 +568,10 @@ async function main() {
       error:
         exitCode === 0
           ? undefined
-          : redactKnownSecrets(stderrCollected || stdoutCollected, bundle.secrets || {}),
+          : redactKnownSecrets(
+              stderrCollected || stdoutCollected,
+              fatalReportContext ? fatalReportContext.secrets : bundle.secrets || {},
+            ),
     },
     patch,
     evidence,
