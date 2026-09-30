@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.7
+// OTONOM Trusted Worker Runner — version 2026.09.8
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -493,8 +493,12 @@ async function main() {
 
   // 6. Execute OpenCode directly. Provider credentials, if any, are only
   // the explicitly delegated task secrets returned by the authenticated control plane.
-  const sanitizedEnv = buildSanitizedEnvironment(bundle.secrets || {});
-  const safeCommandEnv = buildSanitizedEnvironment({});
+  // Node child-process cwd does not rewrite an inherited PWD. OpenCode uses PWD
+  // when establishing its active Location, so bind both the process cwd and PWD
+  // to the verified private target worktree. This prevents the public
+  // worker-market checkout from being mistaken for the target repository.
+  const sanitizedEnv = { ...buildSanitizedEnvironment(bundle.secrets || {}), PWD: workspaceDir };
+  const safeCommandEnv = { ...buildSanitizedEnvironment({}), PWD: workspaceDir };
   const prompt = instructions || 'Review and implement requested changes.';
   const evidence = [];
   let setupExitCode = 0;
@@ -625,7 +629,7 @@ async function main() {
   // 7. Execute required repository-passport quality gates WITHOUT model
   // provider credentials. Gate commands are trusted control-plane metadata.
   if (exitCode === 0) {
-    const gateEnv = buildSanitizedEnvironment({});
+    const gateEnv = { ...buildSanitizedEnvironment({}), PWD: workspaceDir };
     const supportedTypes = new Set(['test', 'lint', 'typecheck', 'format', 'security', 'build']);
     for (const gate of bundle.qualityGates || []) {
       const commands = bundle.qualityGateCommands?.[gate] || [];
