@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.4
+// OTONOM Trusted Worker Runner — version 2026.09.5
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -369,6 +369,7 @@ async function main() {
         cwd: workspaceDir,
         env: safeCommandEnv,
         shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: isPosix,
       });
       activeProcess = child;
@@ -416,6 +417,7 @@ async function main() {
         cwd: workspaceDir,
         env: sanitizedEnv,
         shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: isPosix,
       });
       activeProcess = child;
@@ -504,6 +506,7 @@ async function main() {
             cwd: workspaceDir,
             env: gateEnv,
             shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
             detached: isPosix,
           });
           activeProcess = child;
