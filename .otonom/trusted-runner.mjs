@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.6
+// OTONOM Trusted Worker Runner — version 2026.09.7
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -84,24 +84,101 @@ function redactKnownSecrets(text, taskSecrets = {}) {
 // Set once bootstrap.json is parsed so a fatal error can be reported to the
 // control plane over the authenticated private channel (never the public log).
 let fatalReportContext = null;
+let fatalReportInFlight = null;
 
 async function reportFatalPrivately(err) {
-  if (!fatalReportContext) return;
-  const { controlPlaneUrl, assignmentId, sessionToken, secrets } = fatalReportContext;
-  try {
-    await fetch(`${controlPlaneUrl}/api/v1/workers/events`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
-      body: JSON.stringify({
-        assignmentId,
-        eventId: `evt-fatal-${Date.now()}`,
-        type: 'WORKER_FATAL',
-        payload: { message: redactKnownSecrets(err && err.message ? err.message : String(err), secrets).slice(0, 2000) },
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-  } catch {}
+  if (!fatalReportContext) return false;
+  if (fatalReportInFlight) return fatalReportInFlight;
+
+  fatalReportInFlight = (async () => {
+    const {
+      controlPlaneUrl,
+      assignmentId,
+      sessionToken,
+      taskId,
+      taskNodeId,
+      leaseId,
+      runId,
+      attempt,
+      secrets,
+    } = fatalReportContext;
+    const message = redactKnownSecrets(
+      err && err.message ? err.message : String(err),
+      secrets,
+    ).slice(0, 2000);
+
+    // Prefer the normal failed-result path: it durably transitions the run,
+    // revokes authority, releases capacity, and invokes idempotent cleanup.
+    try {
+      const submitRes = await fetch(`${controlPlaneUrl}/api/v1/workers/submit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          taskId,
+          taskNodeId,
+          leaseId,
+          assignmentId,
+          runId,
+          attempt,
+          evidence: [],
+          result: {
+            status: 'failed',
+            summary: 'Worker runner terminated before completing result collection',
+            error: message,
+          },
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (submitRes.ok) return true;
+    } catch {}
+
+    // If failed submission itself is unavailable, preserve a private
+    // diagnostic event for later reconciliation. Never print the detail.
+    try {
+      await fetch(`${controlPlaneUrl}/api/v1/workers/events`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          assignmentId,
+          eventId: `evt-fatal-${Date.now()}`,
+          type: 'WORKER_FATAL',
+          payload: { message },
+        }),
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch {}
+    return false;
+  })();
+
+  return fatalReportInFlight;
 }
+
+let terminationSignalHandled = false;
+let suppressTerminationFatalReport = false;
+async function handleTerminationSignal(signal) {
+  // Control-plane cancellation/replanning/session revocation already owns the
+  // lifecycle transition. If killing the active child also surfaces SIGTERM
+  // on the runner, let main unwind through the intentional control-abort path
+  // rather than creating a contradictory failed submission.
+  if (suppressTerminationFatalReport) return;
+  if (terminationSignalHandled) return;
+  terminationSignalHandled = true;
+  await reportFatalPrivately(new Error('Worker runner received ' + signal));
+  process.exit(signal === 'SIGTERM' ? 143 : 130);
+}
+
+process.on('SIGTERM', () => {
+  void handleTerminationSignal('SIGTERM');
+});
+process.on('SIGINT', () => {
+  void handleTerminationSignal('SIGINT');
+});
 
 async function performDeployKeyCheckout(cloneUrl, targetSha, privateKey, destDir) {
   const nonce = Date.now() + Math.random().toString(36).slice(2, 6);
@@ -144,11 +221,62 @@ async function performDeployKeyCheckout(cloneUrl, targetSha, privateKey, destDir
   }
 }
 
-async function collectWorktreePatch(workingDirectory, baseSha) {
-  const { stdout: currentHead } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: workingDirectory });
-  if (currentHead.trim() !== baseSha) {
-    throw new Error('Working tree HEAD mismatch: expected base SHA "' + baseSha + '", got "' + currentHead.trim() + '"');
+async function normalizeLocalWorkerHistory(workingDirectory, baseSha) {
+  const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
+  const { stdout: headOut } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: workingDirectory,
+    env: gitEnv,
+  });
+  const currentHead = headOut.trim();
+  if (currentHead === baseSha) return;
+
+  try {
+    await execFileAsync('git', ['merge-base', '--is-ancestor', baseSha, currentHead], {
+      cwd: workingDirectory,
+      env: gitEnv,
+    });
+  } catch {
+    throw new Error(
+      'Working tree HEAD is not a descendant of the immutable base SHA; refusing to normalize local history.',
+    );
   }
+
+  const { stdout: historyOut } = await execFileAsync(
+    'git',
+    ['rev-list', '--parents', baseSha + '..' + currentHead],
+    { cwd: workingDirectory, env: gitEnv, maxBuffer: 1024 * 1024 },
+  );
+  const history = historyOut.split(/\r?\n/).filter(Boolean);
+  if (history.length === 0 || history.length > 64) {
+    throw new Error('Local worker history is empty or exceeds the bounded normalization limit.');
+  }
+  for (const line of history) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length !== 2) {
+      throw new Error(
+        'Local worker history contains a merge or malformed commit; refusing to normalize.',
+      );
+    }
+  }
+
+  // Workers may use local commits as an editing convenience, but commit
+  // metadata/history is never trusted or sent to the target. Convert only a
+  // verified linear descendant back into ordinary working-tree changes.
+  await execFileAsync('git', ['reset', '--mixed', baseSha], {
+    cwd: workingDirectory,
+    env: gitEnv,
+  });
+  const { stdout: normalizedHeadOut } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+    cwd: workingDirectory,
+    env: gitEnv,
+  });
+  if (normalizedHeadOut.trim() !== baseSha) {
+    throw new Error('Failed to restore immutable base SHA after local history normalization.');
+  }
+}
+
+async function collectWorktreePatch(workingDirectory, baseSha) {
+  await normalizeLocalWorkerHistory(workingDirectory, baseSha);
   await execFileAsync('git', ['add', '-N', '.'], { cwd: workingDirectory });
   const { stdout: rawStatus } = await execFileAsync('git', ['status', '--porcelain=v1', '-z', '-uall'], { cwd: workingDirectory });
   if (!rawStatus) return undefined;
@@ -230,6 +358,11 @@ async function main() {
     controlPlaneUrl,
     assignmentId,
     sessionToken,
+    taskId,
+    taskNodeId: bundle.taskNodeId,
+    leaseId: bundle.leaseId,
+    runId,
+    attempt,
     secrets: { ...(bundle.secrets || {}), deployKey: bundle.source && bundle.source.privateDeployKey },
   };
 
@@ -269,9 +402,10 @@ async function main() {
     } catch {}
   }
 
-  function abort(reason) {
+  function abort(reason, suppressFatalReport = false) {
     if (isAborted) return;
     isAborted = true;
+    if (suppressFatalReport) suppressTerminationFatalReport = true;
     console.error('[WorkerRunner] Aborting:', reason);
     if (activeProcess) {
       killProcessTree(activeProcess, 'SIGTERM');
@@ -295,7 +429,7 @@ async function main() {
         body: JSON.stringify({ assignmentId }),
       });
       if (res.status === 401 || res.status === 403) {
-        abort('Heartbeat rejected: session revoked or expired');
+        abort('Heartbeat rejected: session revoked or expired', true);
       }
     } catch {}
   }, heartbeatInterval);
@@ -310,7 +444,7 @@ async function main() {
         headers: { Authorization: `Bearer ${sessionToken}` },
       });
       if (res.status === 401 || res.status === 403) {
-        abort('Commands channel rejected: session revoked or expired');
+        abort('Commands channel rejected: session revoked or expired', true);
         return;
       }
       if (res.ok) {
@@ -318,7 +452,7 @@ async function main() {
         const commands = Array.isArray(body) ? body : (body.commands || []);
         for (const cmd of commands) {
           if (cmd.type === 'cancel') {
-            abort('Worker cancelled via control-plane command');
+            abort('Worker cancelled via control-plane command', true);
           } else if (cmd.type === 'pause' && activeProcess) {
             killProcessTree(activeProcess, 'SIGSTOP');
           } else if (cmd.type === 'resume' && activeProcess) {
@@ -328,7 +462,7 @@ async function main() {
           } else if (cmd.type === 'retry') {
             pendingInstructions.push('Retry the previous task step, inspect the current worktree, and fix remaining issues.');
           } else if (cmd.type === 'replan_required') {
-            abort('Worker stopped because replanning is required');
+            abort('Worker stopped because replanning is required', true);
           }
         }
         if (commands.length > 0) {
@@ -481,7 +615,11 @@ async function main() {
   if (isAborted) {
     clearInterval(heartbeatTimer);
     clearInterval(commandTimer);
-    throw new Error('Worker execution aborted: authority revoked or assignment cancelled.');
+    const controlAbort = new Error(
+      'Worker execution aborted: authority revoked or assignment cancelled.',
+    );
+    controlAbort.suppressFatalReport = true;
+    throw controlAbort;
   }
 
   // 7. Execute required repository-passport quality gates WITHOUT model
@@ -601,8 +739,11 @@ if (process.argv[1] && process.argv[1].endsWith('trusted-runner.mjs')) {
   main().catch(async (err) => {
     // Deliberately no error detail on stdout: git/network errors embed the
     // private target remote, and this log is public on the worker-market
-    // repository. The detail goes to the control plane privately instead.
-    await reportFatalPrivately(err);
+    // repository. Intentional control aborts have already had their authority
+    // revoked and must not attempt a new submission with a dead session.
+    if (!err || !err.suppressFatalReport) {
+      await reportFatalPrivately(err);
+    }
     console.error('[WorkerRunner Fatal] Run failed; details withheld from public logs.');
     process.exit(1);
   });
