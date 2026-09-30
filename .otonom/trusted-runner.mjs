@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.3
+// OTONOM Trusted Worker Runner — version 2026.09.4
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -74,6 +74,28 @@ function redactKnownSecrets(text, taskSecrets = {}) {
     }
   }
   return result;
+}
+
+// Set once bootstrap.json is parsed so a fatal error can be reported to the
+// control plane over the authenticated private channel (never the public log).
+let fatalReportContext = null;
+
+async function reportFatalPrivately(err) {
+  if (!fatalReportContext) return;
+  const { controlPlaneUrl, assignmentId, sessionToken, secrets } = fatalReportContext;
+  try {
+    await fetch(`${controlPlaneUrl}/api/v1/workers/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify({
+        assignmentId,
+        eventId: `evt-fatal-${Date.now()}`,
+        type: 'WORKER_FATAL',
+        payload: { message: redactKnownSecrets(err && err.message ? err.message : String(err), secrets).slice(0, 2000) },
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {}
 }
 
 async function performDeployKeyCheckout(cloneUrl, targetSha, privateKey, destDir) {
@@ -199,6 +221,12 @@ async function main() {
   const bundle = JSON.parse(fs.readFileSync(bootstrapPath, 'utf8'));
   const { assignmentId, sessionToken, taskId, runId, attempt, baseSha, instructions } = bundle;
   const workspaceDir = path.resolve('.otonom/target-worktree');
+  fatalReportContext = {
+    controlPlaneUrl,
+    assignmentId,
+    sessionToken,
+    secrets: { ...(bundle.secrets || {}), deployKey: bundle.source && bundle.source.privateDeployKey },
+  };
 
   // 1. Checkout source if deploy key strategy used
   try {
@@ -559,9 +587,11 @@ async function main() {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('trusted-runner.mjs')) {
-  main().catch((err) => {
-    // Deliberately no error detail: git/network errors embed the private
-    // target remote, and this log is public on the worker-market repository.
+  main().catch(async (err) => {
+    // Deliberately no error detail on stdout: git/network errors embed the
+    // private target remote, and this log is public on the worker-market
+    // repository. The detail goes to the control plane privately instead.
+    await reportFatalPrivately(err);
     console.error('[WorkerRunner Fatal] Run failed; details withheld from public logs.');
     process.exit(1);
   });
