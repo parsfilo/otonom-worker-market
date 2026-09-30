@@ -1,0 +1,77 @@
+# OTONOM trusted worker workflow -- version 2026.09.4
+# Generated and owned by OTONOM (public generic worker market). Do not edit by
+# hand: the control plane binds worker authentication to this workflow's
+# repository, ref and commit.
+name: OTONOM Worker
+run-name: OTONOM worker ${{ inputs.assignment_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      assignment_id:
+        description: 'Opaque assignment id'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    name: worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout worker runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          npm install --global @opencode/cli@2.0.16
+          opencode --version
+
+      - name: Bootstrap OTONOM worker session
+        env:
+          OTONOM_CONTROL_PLANE_URL: ${{ secrets.OTONOM_CONTROL_PLANE_URL }}
+          OTONOM_ASSIGNMENT_ID: ${{ inputs.assignment_id }}
+        run: |
+          set -uo pipefail
+          umask 077
+          fail() { echo "OTONOM worker bootstrap failed." >&2; exit 1; }
+          [ -n "$OTONOM_CONTROL_PLANE_URL" ] || fail
+          HOST="${OTONOM_CONTROL_PLANE_URL#*://}"
+          HOST="${HOST%%[/:?#]*}"
+          echo "::add-mask::$HOST"
+          AUDIENCE=$(printf '%s' "$OTONOM_CONTROL_PLANE_URL" | jq -sRr @uri) || fail
+          echo "::add-mask::$AUDIENCE"
+          OIDC_TOKEN=$(curl --fail --silent --location \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" 2>/dev/null | jq -er '.value' 2>/dev/null) || fail
+          echo "::add-mask::$OIDC_TOKEN"
+          jq -n \
+            --arg assignmentId "$OTONOM_ASSIGNMENT_ID" \
+            --arg oidcToken "$OIDC_TOKEN" \
+            '{assignmentId: $assignmentId, oidcToken: $oidcToken}' | \
+            curl --fail --silent --location \
+              -X POST "$OTONOM_CONTROL_PLANE_URL/api/v1/workers/bootstrap" \
+              -H "Content-Type: application/json" \
+              --data-binary @- \
+              -o bootstrap.json 2>/dev/null || fail
+          chmod 600 bootstrap.json
+
+      - name: Execute OTONOM worker runner
+        env:
+          OTONOM_CONTROL_PLANE_URL: ${{ secrets.OTONOM_CONTROL_PLANE_URL }}
+        run: |
+          HOST="${OTONOM_CONTROL_PLANE_URL#*://}"
+          HOST="${HOST%%[/:?#]*}"
+          echo "::add-mask::$HOST"
+          node .otonom/trusted-runner.mjs
