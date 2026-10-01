@@ -1,4 +1,4 @@
-# OTONOM trusted worker workflow -- version 2026.09.4
+# OTONOM trusted worker workflow -- version 2026.10.1
 # Generated and owned by OTONOM (public generic worker market). Do not edit by
 # hand: the control plane binds worker authentication to this workflow's
 # repository, ref and commit.
@@ -45,27 +45,52 @@ jobs:
         run: |
           set -uo pipefail
           umask 077
-          fail() { echo "OTONOM worker bootstrap failed." >&2; exit 1; }
-          [ -n "$OTONOM_CONTROL_PLANE_URL" ] || fail
+          fail() { echo "OTONOM worker bootstrap failed: $1" >&2; exit 1; }
+          [ -n "$OTONOM_CONTROL_PLANE_URL" ] || fail missing_control_plane_url
           HOST="${OTONOM_CONTROL_PLANE_URL#*://}"
           HOST="${HOST%%[/:?#]*}"
           echo "::add-mask::$HOST"
-          AUDIENCE=$(printf '%s' "$OTONOM_CONTROL_PLANE_URL" | jq -sRr @uri) || fail
+          AUDIENCE=$(printf '%s' "$OTONOM_CONTROL_PLANE_URL" | jq -sRr @uri) || fail audience_encode
           echo "::add-mask::$AUDIENCE"
-          OIDC_TOKEN=$(curl --fail --silent --location \
+
+          OIDC_BODY=$(mktemp) || fail oidc_tmp_creation
+          trap 'rm -f "$OIDC_BODY" bootstrap-request.json bootstrap.json' EXIT
+          OIDC_STATUS=$(curl --silent --location \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" 2>/dev/null | jq -er '.value' 2>/dev/null) || fail
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" \
+            --output "$OIDC_BODY" \
+            --write-out '%{http_code}' 2>/dev/null) || fail oidc_transport
+          case "$OIDC_STATUS" in
+            2??) ;;
+            *) fail "oidc_http_$OIDC_STATUS" ;;
+          esac
+          OIDC_TOKEN=$(jq -er '.value' "$OIDC_BODY" 2>/dev/null) || fail oidc_response_invalid
+          rm -f "$OIDC_BODY"
           echo "::add-mask::$OIDC_TOKEN"
+
           jq -n \
             --arg assignmentId "$OTONOM_ASSIGNMENT_ID" \
             --arg oidcToken "$OIDC_TOKEN" \
-            '{assignmentId: $assignmentId, oidcToken: $oidcToken}' | \
-            curl --fail --silent --location \
-              -X POST "$OTONOM_CONTROL_PLANE_URL/api/v1/workers/bootstrap" \
-              -H "Content-Type: application/json" \
-              --data-binary @- \
-              -o bootstrap.json 2>/dev/null || fail
+            '{assignmentId: $assignmentId, oidcToken: $oidcToken}' \
+            > bootstrap-request.json || fail bootstrap_request_build
+          BOOTSTRAP_STATUS=$(curl --silent --location \
+            -X POST "$OTONOM_CONTROL_PLANE_URL/api/v1/workers/bootstrap" \
+            -H "Content-Type: application/json" \
+            --data-binary @bootstrap-request.json \
+            -o bootstrap.json \
+            --write-out '%{http_code}' 2>/dev/null) || fail bootstrap_transport
+          rm -f bootstrap-request.json
+          case "$BOOTSTRAP_STATUS" in
+            2??) ;;
+            *)
+              ERROR_CODE=$(jq -r '.error // "UNKNOWN"' bootstrap.json 2>/dev/null | tr -cd 'A-Z0-9_-' | cut -c1-64)
+              [ -n "$ERROR_CODE" ] || ERROR_CODE=UNKNOWN
+              rm -f bootstrap.json
+              fail "bootstrap_http_${BOOTSTRAP_STATUS}_${ERROR_CODE}"
+              ;;
+          esac
           chmod 600 bootstrap.json
+          trap - EXIT
 
       - name: Execute OTONOM worker runner
         env:
