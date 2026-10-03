@@ -1,4 +1,4 @@
-// OTONOM Trusted Worker Runner — version 2026.09.8
+// OTONOM Trusted Worker Runner — version 2026.10.1
 // Self-contained, dependency-free runner for ephemeral GitHub Actions workers.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -221,6 +221,74 @@ async function performDeployKeyCheckout(cloneUrl, targetSha, privateKey, destDir
   }
 }
 
+const PUBLIC_GITHUB_CLONE_URL = new RegExp("^https:\\/\\/github\\.com\\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\\/([A-Za-z0-9._-]{1,100})\\.git$");
+const FULL_GIT_SHA = /^[0-9a-f]{40}$/;
+
+// Environment for the credential-free public checkout: an allowlist only, so no
+// token, SSH agent, askpass helper or inherited git configuration can reach git.
+function buildPublicGitEnvironment() {
+  const env = {};
+  const passthrough = [
+    'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'TEMP', 'TMP',
+    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'GIT_SSL_CAINFO', 'NODE_EXTRA_CA_CERTS',
+    'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy',
+  ];
+  for (const k of passthrough) {
+    if (process.env[k] !== undefined) env[k] = process.env[k];
+  }
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_ASKPASS = '/bin/false';
+  env.GIT_CONFIG_NOSYSTEM = '1';
+  env.GIT_CONFIG_GLOBAL = '/dev/null';
+  return env;
+}
+
+async function performPublicHttpsCheckout(cloneUrl, targetSha, destDir) {
+  const parsed = typeof cloneUrl === 'string' ? PUBLIC_GITHUB_CLONE_URL.exec(cloneUrl) : null;
+  if (!parsed || /^\.+$/.test(parsed[2])) {
+    throw new Error('Refusing public HTTPS checkout: clone URL is not a canonical github.com repository URL.');
+  }
+  if (typeof targetSha !== 'string' || !FULL_GIT_SHA.test(targetSha)) {
+    throw new Error('Refusing public HTTPS checkout: target SHA is not a full 40-hex commit id.');
+  }
+
+  const gitEnv = buildPublicGitEnvironment();
+  // Hard-disable every credential path and every non-HTTPS transport for these commands.
+  const safeGit = [
+    '-c', 'credential.helper=',
+    '-c', 'core.askPass=',
+    '-c', 'protocol.allow=never',
+    '-c', 'protocol.https.allow=always',
+    '-c', 'http.followRedirects=false',
+  ];
+
+  fs.mkdirSync(destDir, { recursive: true });
+  if (!fs.existsSync(path.join(destDir, '.git'))) {
+    await execFileAsync('git', ['init'], { cwd: destDir, env: gitEnv });
+  }
+  const { stdout: remotesOut } = await execFileAsync('git', ['remote'], { cwd: destDir, env: gitEnv });
+  if (remotesOut.split(/\s+/).includes('origin')) {
+    await execFileAsync('git', ['remote', 'remove', 'origin'], { cwd: destDir, env: gitEnv });
+  }
+  await execFileAsync('git', ['remote', 'add', 'origin', cloneUrl], { cwd: destDir, env: gitEnv });
+
+  await execFileAsync('git', [...safeGit, 'fetch', '--depth=1', '--no-tags', 'origin', targetSha], {
+    cwd: destDir,
+    env: gitEnv,
+  });
+  await execFileAsync('git', ['checkout', '--force', '--detach', targetSha], { cwd: destDir, env: gitEnv });
+
+  const { stdout: headShaOut } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: destDir, env: gitEnv });
+  const verifiedSha = headShaOut.trim();
+  if (verifiedSha !== targetSha) {
+    throw new Error('Checkout SHA mismatch: expected "' + targetSha + '", got "' + verifiedSha + '"');
+  }
+
+  // The worker has no write path to the target: the remote is removed once the
+  // exact SHA is verified, so there is nothing left to push to.
+  await execFileAsync('git', ['remote', 'remove', 'origin'], { cwd: destDir, env: gitEnv });
+}
+
 async function normalizeLocalWorkerHistory(workingDirectory, baseSha) {
   const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
   const { stdout: headOut } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
@@ -366,7 +434,7 @@ async function main() {
     secrets: { ...(bundle.secrets || {}), deployKey: bundle.source && bundle.source.privateDeployKey },
   };
 
-  // 1. Checkout source if deploy key strategy used
+  // 1. Checkout source: the deploy-key strategy, or credential-free public HTTPS
   try {
     if (bundle.source && bundle.source.strategy === 'READ_ONLY_DEPLOY_KEY') {
       await performDeployKeyCheckout(
@@ -375,6 +443,8 @@ async function main() {
         bundle.source.privateDeployKey,
         workspaceDir,
       );
+    } else if (bundle.source && bundle.source.strategy === 'PUBLIC_HTTPS') {
+      await performPublicHttpsCheckout(bundle.source.cloneUrl, bundle.source.targetSha, workspaceDir);
     }
   } finally {
     // 2. Immediately shred and delete bootstrap.json before OpenCode runs
