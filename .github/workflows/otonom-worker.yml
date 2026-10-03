@@ -1,4 +1,4 @@
-# OTONOM trusted worker workflow -- version 2026.10.1
+# OTONOM trusted worker workflow -- version 2026.10.2
 # Generated and owned by OTONOM (public generic worker market). Do not edit by
 # hand: the control plane binds worker authentication to this workflow's
 # repository, ref and commit.
@@ -73,12 +73,26 @@ jobs:
             --arg oidcToken "$OIDC_TOKEN" \
             '{assignmentId: $assignmentId, oidcToken: $oidcToken}' \
             > bootstrap-request.json || fail bootstrap_request_build
-          BOOTSTRAP_STATUS=$(curl --silent --location \
-            -X POST "$OTONOM_CONTROL_PLANE_URL/api/v1/workers/bootstrap" \
-            -H "Content-Type: application/json" \
-            --data-binary @bootstrap-request.json \
-            -o bootstrap.json \
-            --write-out '%{http_code}' 2>/dev/null) || fail bootstrap_transport
+          BOOTSTRAP_ATTEMPT=1
+          BOOTSTRAP_MAX_ATTEMPTS=3
+          while :; do
+            if BOOTSTRAP_STATUS=$(curl --silent --location \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -X POST "$OTONOM_CONTROL_PLANE_URL/api/v1/workers/bootstrap" \
+              -H "Content-Type: application/json" \
+              --data-binary @bootstrap-request.json \
+              -o bootstrap.json \
+              --write-out '%{http_code}' 2>/dev/null); then
+              break
+            fi
+            if [ "$BOOTSTRAP_ATTEMPT" -ge "$BOOTSTRAP_MAX_ATTEMPTS" ]; then
+              fail bootstrap_transport
+            fi
+            echo "OTONOM worker bootstrap transport retry ${BOOTSTRAP_ATTEMPT}/${BOOTSTRAP_MAX_ATTEMPTS}" >&2
+            sleep "$BOOTSTRAP_ATTEMPT"
+            BOOTSTRAP_ATTEMPT=$((BOOTSTRAP_ATTEMPT + 1))
+          done
           rm -f bootstrap-request.json
           case "$BOOTSTRAP_STATUS" in
             2??) ;;
